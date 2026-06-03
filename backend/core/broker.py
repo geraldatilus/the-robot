@@ -195,6 +195,102 @@ class Broker:
             log.error(f"bars {symbol}: {e}")
             return []
 
+    async def bars_batch(self, symbols: List[str], tf: str = "1Min", limit: int = 150) -> Dict[str, List[Dict]]:
+        """Fetch bars for all symbols in one API call."""
+        try:
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+            from alpaca.data.enums import DataFeed
+            from alpaca.common.enums import Sort
+            from datetime import timezone
+
+            tf_map = {"1Min": TimeFrame.Minute, "5Min": TimeFrame(5,"Min"),
+                      "15Min": TimeFrame(15,"Min"), "1Hour": TimeFrame.Hour, "1Day": TimeFrame.Day}
+            now   = datetime.now(timezone.utc)
+            end   = now - timedelta(minutes=1)
+            start = now - timedelta(hours=8)
+
+            req  = StockBarsRequest(
+                symbol_or_symbols=symbols,
+                timeframe=tf_map.get(tf, TimeFrame.Minute),
+                start=start, end=end, limit=limit,
+                feed=DataFeed.IEX, sort=Sort.DESC,
+            )
+            resp = await self._run(self._dc().get_stock_bars, req)
+            raw_data = resp.data if hasattr(resp, "data") else {}
+
+            result: Dict[str, List[Dict]] = {}
+            for sym, bars in raw_data.items():
+                parsed = []
+                for b in bars:
+                    if isinstance(b, dict):
+                        ts = b.get("timestamp")
+                        row = {"time": int(ts.timestamp()) if ts else 0,
+                               "open": float(b.get("open",0)), "high": float(b.get("high",0)),
+                               "low":  float(b.get("low",0)),  "close": float(b.get("close",0)),
+                               "volume": float(b.get("volume",0))}
+                    else:
+                        row = {"time": int(b.timestamp.timestamp()),
+                               "open": float(b.open), "high": float(b.high),
+                               "low":  float(b.low),  "close": float(b.close),
+                               "volume": float(b.volume)}
+                    if row["close"] > 0:
+                        parsed.append(row)
+                parsed.reverse()
+                if parsed:
+                    result[sym] = parsed
+            return result
+        except Exception as e:
+            log.error(f"bars_batch: {e}")
+            return {}
+
+    async def bars_batch_daily(self, symbols: List[str], limit: int = 60) -> Dict[str, List[Dict]]:
+        """Fetch daily bars — always available, used as after-hours fallback."""
+        try:
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+            from alpaca.data.enums import DataFeed
+            from alpaca.common.enums import Sort
+            from datetime import timezone
+
+            now   = datetime.now(timezone.utc)
+            end   = now
+            start = now - timedelta(days=90)
+
+            req  = StockBarsRequest(
+                symbol_or_symbols=symbols,
+                timeframe=TimeFrame.Day,
+                start=start, end=end, limit=limit,
+                feed=DataFeed.IEX, sort=Sort.DESC,
+            )
+            resp = await self._run(self._dc().get_stock_bars, req)
+            raw_data = resp.data if hasattr(resp, "data") else {}
+
+            result: Dict[str, List[Dict]] = {}
+            for sym, bars in raw_data.items():
+                parsed = []
+                for b in bars:
+                    if isinstance(b, dict):
+                        ts = b.get("timestamp")
+                        row = {"time": int(ts.timestamp()) if ts else 0,
+                               "open": float(b.get("open",0)), "high": float(b.get("high",0)),
+                               "low":  float(b.get("low",0)),  "close": float(b.get("close",0)),
+                               "volume": float(b.get("volume",0))}
+                    else:
+                        row = {"time": int(b.timestamp.timestamp()),
+                               "open": float(b.open), "high": float(b.high),
+                               "low":  float(b.low),  "close": float(b.close),
+                               "volume": float(b.volume)}
+                    if row["close"] > 0:
+                        parsed.append(row)
+                parsed.reverse()
+                if parsed:
+                    result[sym] = parsed
+            return result
+        except Exception as e:
+            log.error(f"bars_batch_daily: {e}")
+            return {}
+
     async def latest_quote(self, symbol: str) -> Optional[Dict]:
         """Latest trade price via IEX REST."""
         try:

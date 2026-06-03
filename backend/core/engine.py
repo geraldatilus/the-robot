@@ -149,14 +149,17 @@ class Engine:
         self.broker: Optional[Broker]          = None
         self.positions: Dict[str, Position]    = {}
         self.scan_results: Dict[str, Dict]     = {}
-        self.bar_buffers:  Dict[str, List]     = {}   # persistent across poll cycles
+        self.bar_buffers:  Dict[str, List]     = {}
+        self.daily_buffers: Dict[str, List]   = {}
         self.trade_log: List[Dict]             = []
         self.daily_pnl     = 0.0
         self.pnl_date      = date.today()
         self.current_scan  = ""
+        self._cached_equity = 100_000.0
         self.start_time: Optional[datetime]    = None
         self._broadcast_fn: Optional[Callable] = None
         self._stream_thread: Optional[threading.Thread] = None
+        self._data_task: Optional[asyncio.Task]         = None
         self._poll_task: Optional[asyncio.Task]         = None
         self._monitor_task: Optional[asyncio.Task]      = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -193,19 +196,19 @@ class Engine:
         # Adopt any positions already open on Alpaca before the engine started
         await self._sync_existing_positions()
 
-        # Start both — stream fires when market is open, poll runs always
-        self._start_stream()
-        self._poll_task    = asyncio.create_task(self._poll_worker())
+        # Data worker fetches bars silently; scan worker reads from cache only
+        self._data_task    = asyncio.create_task(self._data_worker())
+        self._poll_task    = asyncio.create_task(self._scan_worker())
         self._monitor_task = asyncio.create_task(self._monitor())
 
         self._emit("engine_state", {"state": self.state, "scan_mode": self.scan_mode})
-        log.info("Engine started (stream + 24/7 polling)")
+        log.info("Engine started")
 
     async def stop(self):
         self.state     = "STOPPED"
         self.scan_mode = "IDLE"
         self._stop_stream()
-        for task in (self._poll_task, self._monitor_task):
+        for task in (self._data_task, self._poll_task, self._monitor_task):
             if task:
                 task.cancel()
         self._emit("engine_state", {"state": self.state})
@@ -304,54 +307,70 @@ class Engine:
                 self._loop,
             )
 
-    # ── 24/7 polling worker ───────────────────────────────────────────────────
+    # ── data worker — silently refreshes bar buffers ──────────────────────────
 
-    async def _poll_worker(self):
-        """
-        Fetches recent bars for every symbol on a fixed interval.
-        Runs regardless of market hours — covers pre-market, after-hours,
-        weekends, and stream outages.
-        """
-        # brief startup delay so stream gets first shot during market hours
-        await asyncio.sleep(15)
-
+    async def _data_worker(self):
+        """One batch API call every 30s. Never blocks the scanner."""
+        first = True
         while self.state == "RUNNING":
             symbols = self.cfg.get("scanner", {}).get("universe", [])
-            if not symbols:
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
+            if symbols:
+                try:
+                    acct_task  = asyncio.create_task(self.broker.account())
+                    batch_task = asyncio.create_task(
+                        self.broker.bars_batch(symbols, "1Min", 200 if first else 5)
+                    )
+                    daily_task = asyncio.create_task(
+                        self.broker.bars_batch_daily(symbols, 60)
+                    )
+                    acct, batch, daily = await asyncio.gather(acct_task, batch_task, daily_task)
+                    self._cached_equity = acct.get("equity", 100_000.0)
+                    for sym, bars in daily.items():
+                        if bars:
+                            self.daily_buffers[sym] = bars
+                    for sym, bars in batch.items():
+                        buf = self.bar_buffers.setdefault(sym, [])
+                        existing = {b["time"] for b in buf}
+                        new_bars = [b for b in bars if b["time"] not in existing]
+                        if new_bars:
+                            buf.extend(new_bars)
+                            buf.sort(key=lambda x: x["time"])
+                            if len(buf) > 200:
+                                self.bar_buffers[sym] = buf[-200:]
+                            if sym in self.positions:
+                                pos_times = {x["time"] for x in self.positions[sym].bars}
+                                for bar in new_bars:
+                                    if bar["time"] not in pos_times:
+                                        await self._manage_position(sym, bar)
+                    first = False
+                    log.info(f"Data refresh — {len(batch)} symbols, equity={self._cached_equity:.0f}")
+                except Exception as e:
+                    log.error(f"data_worker: {e}")
+            await asyncio.sleep(30)
 
-            log.info(f"Poll cycle — {len(symbols)} symbols  |  {len(self.positions)} managed positions")
+    # ── scan worker — pure computation, zero API calls ─────────────────────────
+
+    async def _scan_worker(self):
+        """Reads from cached buffers only. Nothing blocks it."""
+        await asyncio.sleep(6)
+        while self.state == "RUNNING":
+            symbols = self.cfg.get("scanner", {}).get("universe", [])
             for sym in symbols:
                 if self.state != "RUNNING":
                     return
-                try:
-                    self.current_scan = sym
-                    self._emit("scan_progress", {"symbol": sym, "mode": "poll"})
-
-                    bars = await self.broker.bars(sym, "1Min", 100)
-                    if bars:
-                        # merge into persistent buffer
-                        buf = self.bar_buffers.setdefault(sym, [])
-                        existing_times = {b["time"] for b in buf}
-                        new_bars = [b for b in bars if b["time"] not in existing_times]
-                        buf.extend(new_bars)
-                        buf.sort(key=lambda x: x["time"])
-                        if len(buf) > 200:
-                            self.bar_buffers[sym] = buf[-200:]
-
-                        await self._evaluate_symbol(sym, self.bar_buffers[sym], source="poll")
-
-                        # ── Stop loss monitoring via polling (covers stream gaps) ──
-                        if sym in self.positions and new_bars:
-                            for bar in new_bars:
-                                await self._manage_position(sym, bar)
-                except Exception as e:
-                    log.error(f"Poll {sym}: {e}")
-
-                await asyncio.sleep(POLL_SYM_DELAY)
-
-            await asyncio.sleep(POLL_INTERVAL)
+                buf = self.bar_buffers.get(sym)
+                self.current_scan = sym
+                self._emit("scan_progress", {"symbol": sym, "mode": "poll"})
+                await asyncio.sleep(0.4)
+                bars = buf if (buf and len(buf) >= 22) else self.daily_buffers.get(sym, [])
+                if bars:
+                    try:
+                        await self._evaluate_symbol(sym, bars, source="poll",
+                                                    equity=self._cached_equity)
+                    except Exception as e:
+                        log.error(f"scan {sym}: {e}")
+            self.current_scan = ""
+            self._emit("scan_progress", {"symbol": "", "mode": "idle"})
 
     # ── core evaluation (shared by stream and poll) ───────────────────────────
 
@@ -367,12 +386,11 @@ class Engine:
         if symbol in self.positions:
             await self._manage_position(symbol, bar)
 
-    async def _evaluate_symbol(self, symbol: str, bars: List[Dict], source: str):
+    async def _evaluate_symbol(self, symbol: str, bars: List[Dict], source: str,
+                               equity: float = 100_000.0):
         if not bars:
             return
-        acct   = await self.broker.account()
-        equity = acct.get("equity", 100_000)
-        sig    = check_entry(symbol, bars, equity, self.cfg)
+        sig = check_entry(symbol, bars, equity, self.cfg)
 
         result = {
             "symbol":      symbol,
@@ -394,7 +412,7 @@ class Engine:
         self._emit("scan_update", {k: v for k, v in result.items() if k != "bars"})
 
         if sig.passed and self.state == "RUNNING" and source in ("stream", "poll"):
-            await self._try_open(sig)
+            asyncio.create_task(self._try_open(sig))
 
     # ── position management ───────────────────────────────────────────────────
 
@@ -473,7 +491,7 @@ class Engine:
         # Use LOW — catches intrabar wicks through the stop, not just the close
         if bar["low"] <= pos.stop:
             log.warning(f"STOP HIT {symbol}: low={bar['low']:.4f} <= stop={pos.stop:.4f}")
-            await self._close_position(symbol, "stop")
+            asyncio.create_task(self._close_position(symbol, "stop"))
             return
 
         self._emit("position_update", pos.to_dict())
@@ -521,6 +539,20 @@ class Engine:
 
                 self._emit("account_update", acct)
                 self._emit("positions_update", [p.to_dict() for p in self.positions.values()])
+
+                # After-hours stop protection — check live quote for every open position
+                for sym, pos in list(self.positions.items()):
+                    try:
+                        quote = await self.broker.latest_quote(sym)
+                        if quote and quote.get("price"):
+                            price = quote["price"]
+                            pos.price = price
+                            if price <= pos.stop:
+                                log.warning(f"AFTER-HOURS STOP HIT {sym}: "
+                                            f"price={price:.4f} <= stop={pos.stop:.4f}")
+                                asyncio.create_task(self._close_position(sym, "stop"))
+                    except Exception as e:
+                        log.error(f"after-hours quote {sym}: {e}")
 
                 # Broadcast Alpaca's actual open positions (includes manual trades)
                 alpaca_pos = await self.broker.positions()
