@@ -193,13 +193,12 @@ class Engine:
         # Adopt any positions already open on Alpaca before the engine started
         await self._sync_existing_positions()
 
-        # Start both — stream fires when market is open, poll runs always
-        self._start_stream()
+        # Poll-only — no stream to avoid connection limit errors
         self._poll_task    = asyncio.create_task(self._poll_worker())
         self._monitor_task = asyncio.create_task(self._monitor())
 
         self._emit("engine_state", {"state": self.state, "scan_mode": self.scan_mode})
-        log.info("Engine started (stream + 24/7 polling)")
+        log.info("Engine started")
 
     async def stop(self):
         self.state     = "STOPPED"
@@ -351,7 +350,8 @@ class Engine:
 
                 await asyncio.sleep(POLL_SYM_DELAY)
 
-            await asyncio.sleep(POLL_INTERVAL)
+            self.current_scan = ""
+            self._emit("scan_progress", {"symbol": "", "mode": "idle"})
 
     # ── core evaluation (shared by stream and poll) ───────────────────────────
 
