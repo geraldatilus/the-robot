@@ -1,0 +1,35 @@
+alpaca:
+  api_key: "YOUR_ALPACA_API_KEY"
+  secret_key: "YOUR_ALPACA_SECRET_KEY"
+  paper: true
+
+strategy:
+  ema_fast: 9
+  ema_slow: 21
+  ema_buffer_pct: 0.001
+  min_relative_volume: 1.5
+  rsi_min: 50
+  rsi_max: 70
+  atr_period: 14
+  take_profit_atr_1: 1.5
+  take_profit_atr_2: 3.0
+  take_profit_atr_3: 5.0
+  trailing_trigger_candles: 3
+  timeframe: 1Min
+
+risk:
+  max_position_pct: 0.15
+  risk_per_trade_pct: 0.01
+  daily_loss_limit_pct: 0.03
+  max_open_positions: 5
+
+scanner:
+  universe:
+    - AAPL
+    - TSLA
+    - NVDA
+    - AMD
+    - QQQ
+    - SPY
+  min_price: 1.0
+  max_price: 2000.0

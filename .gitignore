@@ -1,0 +1,21 @@
+# Python
+backend/venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/**/*.pyc
+*.pyc
+*.pyo
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Secrets — never commit real keys
+backend/config/config.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
