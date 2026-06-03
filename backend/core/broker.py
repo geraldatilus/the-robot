@@ -97,6 +97,22 @@ class Broker:
             log.error(f"sell {symbol}: {e}")
             return False
 
+    async def sell_limit(self, symbol: str, qty: int, limit_price: float) -> bool:
+        try:
+            from alpaca.trading.requests import LimitOrderRequest
+            from alpaca.trading.enums import OrderSide, TimeInForce
+            req = LimitOrderRequest(
+                symbol=symbol, qty=qty,
+                limit_price=round(limit_price, 2),
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+            )
+            await self._run(self._tc().submit_order, req)
+            return True
+        except Exception as e:
+            log.error(f"sell_limit {symbol}: {e}")
+            return False
+
     async def close(self, symbol: str) -> bool:
         try:
             await self._run(self._tc().close_position, symbol)
@@ -130,6 +146,8 @@ class Broker:
             end   = now - timedelta(minutes=16)   # IEX REST ~15-min delay
             start = now - timedelta(days=7)
 
+            from alpaca.common.enums import Sort
+
             req = StockBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=tf_map.get(tf, TimeFrame.Minute),
@@ -137,6 +155,7 @@ class Broker:
                 end=end,
                 limit=limit,
                 feed=DataFeed.IEX,
+                sort=Sort.DESC,   # newest first — ensures limit returns most recent bars
             )
 
             resp = await self._run(self._dc().get_stock_bars, req)
@@ -146,7 +165,6 @@ class Broker:
 
             result = []
             for b in data:
-                # b is a dict in 0.43+, a Bar object in older versions
                 if isinstance(b, dict):
                     ts  = b.get("timestamp")
                     raw = {
@@ -168,6 +186,9 @@ class Broker:
                     }
                 if raw["close"] > 0:
                     result.append(raw)
+
+            # Reverse back to chronological order (ASC) for charts + indicators
+            result.reverse()
             return result
 
         except Exception as e:

@@ -16,7 +16,24 @@ const f2 = (v) => v == null ? "—" : `$${Number(v).toFixed(2)}`;
 // ─────────────────────────────────────────────────────────────────────────────
 // Watchlist item (left panel)
 // ─────────────────────────────────────────────────────────────────────────────
-function WatchlistItem({ sym, markets, scanResult, alpacaPos, isCurrent, onRemove }) {
+function PnlTag({ label, value }) {
+  const hasVal = value != null && value !== 0;
+  const pos    = hasVal && value >= 0;
+  const color  = !hasVal ? "#3a4e6a" : pos ? "#00e676" : "#ff3355";
+  return (
+    <div style={{ display:"flex", flexDirection:"column", alignItems:"center",
+                  padding:"1px 5px", borderRadius:2,
+                  background: !hasVal ? "#1a274018" : pos ? "#00e67610" : "#ff335510",
+                  border:`1px solid ${!hasVal ? "#1a274030" : pos ? "#00e67628" : "#ff335528"}` }}>
+      <span style={{ fontSize:7, color:"#3a4e6a", letterSpacing:".06em" }}>{label}</span>
+      <span style={{ fontSize:9, fontWeight:700, color }}>
+        {!hasVal ? "—" : `${pos ? "+" : ""}$${Math.abs(value).toFixed(2)}`}
+      </span>
+    </div>
+  );
+}
+
+function WatchlistItem({ sym, markets, scanResult, alpacaPos, pnl, isCurrent, onRemove }) {
   const passed   = scanResult?.status === "PASSED";
   const scanned  = !!scanResult;
   const scanning = isCurrent;
@@ -30,7 +47,7 @@ function WatchlistItem({ sym, markets, scanResult, alpacaPos, isCurrent, onRemov
       transition:"border-color .3s, background .3s",
     }}>
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:5, minWidth:0 }}>
           <div style={{
             width:7, height:7, borderRadius:"50%", flexShrink:0,
             background: scanning ? "#00c8f0" : passed ? "#00e676" : scanned ? "#ff3355" : "#1a2740",
@@ -56,6 +73,15 @@ function WatchlistItem({ sym, markets, scanResult, alpacaPos, isCurrent, onRemov
                 onMouseLeave={e => e.currentTarget.style.color="#1a2740"}>
           <X size={10}/>
         </button>
+      </div>
+
+      {/* DAY P&L + YEAR P&L always visible under the ticker */}
+      <div style={{ display:"flex", gap:4, marginTop:5 }}>
+        <PnlTag label="DAY P&L"  value={pnl?.day  ?? null}/>
+        <PnlTag label="YEAR P&L" value={pnl?.ytd  ?? null}/>
+        {alpacaPos && (
+          <PnlTag label="OPEN P&L" value={alpacaPos.pl}/>
+        )}
       </div>
 
       {/* gate chips */}
@@ -103,8 +129,28 @@ function WatchlistItem({ sym, markets, scanResult, alpacaPos, isCurrent, onRemov
 // ─────────────────────────────────────────────────────────────────────────────
 // Live scan feed card (center panel)
 // ─────────────────────────────────────────────────────────────────────────────
-function ScanCard({ result, isLatest }) {
+
+function ScanCard({ result, isLatest, pnl, openPos }) {
   const passed = result.status === "PASSED";
+
+  const pl = (v, label, alwaysShow = false) => {
+    if (v == null && !alwaysShow) return null;
+    const hasVal = v != null && v !== 0;
+    const pos    = hasVal && v >= 0;
+    const color  = !hasVal ? "#3a4e6a" : pos ? "#00e676" : "#ff3355";
+    const bg     = !hasVal ? "#1a274018" : pos ? "#00e67612" : "#ff335512";
+    const bdr    = !hasVal ? "#1a274040" : pos ? "#00e67630" : "#ff335530";
+    return (
+      <div style={{ display:"inline-flex", flexDirection:"column", alignItems:"center",
+                    padding:"2px 8px", borderRadius:3, background:bg, border:`1px solid ${bdr}` }}>
+        <span style={{ fontSize:8, color:"#3a4e6a", letterSpacing:".07em" }}>{label}</span>
+        <span style={{ fontSize:11, fontWeight:700, color }}>
+          {!hasVal ? "—" : `${pos ? "+" : ""}$${Math.abs(v).toFixed(2)}`}
+        </span>
+      </div>
+    );
+  };
+
   return (
     <div style={{
       background: isLatest ? (passed ? "#00e67608" : "#0c1120") : "#080d1860",
@@ -114,8 +160,14 @@ function ScanCard({ result, isLatest }) {
     }}>
       {/* header */}
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
-        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
           <span className="ticker" style={{ fontSize:16 }}>{result.symbol}</span>
+
+          {/* P&L — always visible right next to ticker */}
+          {pl(pnl?.day ?? null, "DAY P&L",  true)}
+          {pl(pnl?.ytd ?? null, "YEAR P&L", true)}
+
+          {/* signal badge */}
           <span style={{
             display:"inline-flex", alignItems:"center", gap:4,
             padding:"3px 10px", borderRadius:3, fontSize:11, fontWeight:700,
@@ -126,6 +178,10 @@ function ScanCard({ result, isLatest }) {
             {passed ? <ShoppingCart size={11}/> : <Ban size={11}/>}
             {passed ? "BUY SIGNAL" : "NO TRADE"}
           </span>
+
+          {/* open position — live unrealized P&L */}
+          {openPos && pl(openPos.pl, "OPEN P&L")}
+
           {isLatest && (
             <span style={{ fontSize:9, color:"#00c8f0", fontWeight:700, letterSpacing:".08em" }}>
               ● LATEST
@@ -190,22 +246,23 @@ function Level({ label, value, color }) {
 // Main Scanner
 // ─────────────────────────────────────────────────────────────────────────────
 export default function Scanner() {
-  const { scanResults, currentScan, state, dailyPnl } = useStore();
+  const { scanResults, currentScan, state, dailyPnl, feedFilter } = useStore();
 
   const [watchlist,   setWatchlist]   = useState([]);
   const [marketData,  setMarketData]  = useState({});
   const [alpacaPos,   setAlpacaPos]   = useState([]);
+  const [symPnl,      setSymPnl]      = useState({});
   const [addInput,    setAddInput]    = useState("");
   const [adding,      setAdding]      = useState(false);
   const [bulkOpen,    setBulkOpen]    = useState(false);
   const [bulkLoading, setBulkLoading] = useState(null);
-  const [feedFilter,  setFeedFilter]  = useState("ALL"); // ALL | BUY | SKIP
   const addRef  = useRef(null);
   const bulkRef = useRef(null);
   const feedRef = useRef(null);
 
-  useEffect(() => { loadWatchlist(); loadPositions(); }, []);
+  useEffect(() => { loadWatchlist(); loadPositions(); loadSymPnl(); }, []);
   useEffect(() => { const t = setInterval(loadPositions, 8000); return () => clearInterval(t); }, []);
+  useEffect(() => { const t = setInterval(loadSymPnl, 15000);   return () => clearInterval(t); }, []);
 
   // close bulk dropdown on outside click
   useEffect(() => {
@@ -238,6 +295,13 @@ export default function Scanner() {
     try {
       const pos = await fetch("/api/positions").then(r => r.json());
       setAlpacaPos(Array.isArray(pos) ? pos : []);
+    } catch {}
+  }
+
+  async function loadSymPnl() {
+    try {
+      const data = await fetch("/api/pnl/symbols").then(r => r.json());
+      setSymPnl(data || {});
     } catch {}
   }
 
@@ -435,6 +499,7 @@ export default function Scanner() {
               markets={w.markets}
               scanResult={scanBySymbol[w.symbol]}
               alpacaPos={posBySymbol[w.symbol]}
+              pnl={symPnl[w.symbol] || null}
               isCurrent={currentScan === w.symbol}
               onRemove={removeSymbol}
             />
@@ -470,29 +535,9 @@ export default function Scanner() {
             )}
           </div>
 
-          <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-            {[
-              { id:"ALL",      label:"ALL"                                        },
-              { id:"BUY",      label:"BUY"                                        },
-              { id:"SKIP",     label:"SKIP"                                       },
-              { id:"HOLDINGS", label:`HOLDINGS${heldSymbols.length ? ` (${heldSymbols.length})` : ""}` },
-            ].map(f => (
-              <button key={f.id} onClick={() => setFeedFilter(f.id)} className="btn"
-                      style={{ padding:"3px 10px", fontSize:10,
-                               borderColor: feedFilter === f.id
-                                 ? (f.id === "HOLDINGS" ? "#00e676" : "#00c8f0")
-                                 : "#1a2740",
-                               color: feedFilter === f.id
-                                 ? (f.id === "HOLDINGS" ? "#00e676" : "#00c8f0")
-                                 : "#3a4e6a",
-                               background: feedFilter === f.id && f.id === "HOLDINGS"
-                                 ? "#00e67610" : "" }}>
-                {f.label}
-              </button>
-            ))}
-            <div style={{ width:1, height:14, background:"#1a2740", margin:"0 4px" }}/>
+          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
             <span className="bull" style={{ fontSize:11 }}>{passed} <span className="dim">BUY</span></span>
-            <span className="bear" style={{ fontSize:11, marginLeft:4 }}>{failed} <span className="dim">SKIP</span></span>
+            <span className="bear" style={{ fontSize:11 }}>{failed} <span className="dim">SKIP</span></span>
           </div>
         </div>
 
@@ -541,7 +586,9 @@ export default function Scanner() {
             </div>
           )}
           {feed.map((r, i) => (
-            <ScanCard key={`${r.symbol}-${r.timestamp}`} result={r} isLatest={i === 0}/>
+            <ScanCard key={`${r.symbol}-${r.timestamp}`} result={r} isLatest={i === 0}
+                      pnl={symPnl[r.symbol] || null}
+                      openPos={posBySymbol[r.symbol] || null}/>
           ))}
         </div>
 

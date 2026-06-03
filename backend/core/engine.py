@@ -12,7 +12,7 @@ from typing import Dict, List, Any, Optional, Callable
 from .config     import load, save
 from .broker     import Broker
 from .strategy   import check_entry, EntrySignal
-from .indicators import ema
+from .indicators import ema, atr
 
 log = logging.getLogger(__name__)
 
@@ -24,22 +24,91 @@ POLL_SYM_DELAY  = 0.8  # seconds between each symbol during polling
 
 class Position:
     def __init__(self, sig: EntrySignal):
-        self.symbol       = sig.symbol
-        self.entry        = sig.entry_price
-        self.stop         = sig.stop_price
-        self.t1           = sig.target_1
-        self.t2           = sig.target_2
-        self.t3           = sig.target_3
-        self.atr          = sig.atr_val
-        self.qty          = sig.qty
-        self.qty_left     = sig.qty
-        self.price        = sig.entry_price
-        self.trail_active = False
-        self.t1_done      = False
-        self.t2_done      = False
-        self.opens        = datetime.utcnow()
+        self.symbol        = sig.symbol
+        self.entry         = sig.entry_price
+        self.stop          = sig.stop_price
+        self.t1            = sig.target_1
+        self.t2            = sig.target_2
+        self.t3            = sig.target_3
+        self.atr           = sig.atr_val
+        self.qty           = sig.qty
+        self.qty_left      = sig.qty
+        self.price         = sig.entry_price
+        self.trail_active  = False
+        self.t1_done       = False
+        self.t2_done       = False
+        self.opens         = datetime.utcnow()
         self.bars: List[Dict] = []
-        self.green_streak = 0
+        self.green_streak  = 0
+        self.stop_history: List[Dict] = []   # [{time, price}] — trail path for chart
+
+    @classmethod
+    def from_alpaca(cls, symbol: str, entry: float, qty: int,
+                    bars: List[Dict], cfg: Dict) -> "Position":
+        """
+        Reconstruct a Position for an Alpaca-held trade the engine doesn't track.
+        Replays recent bars to restore trail state, stop level, and target status
+        exactly as if the engine had been running the whole time.
+        """
+        s       = cfg.get("strategy", {})
+        highs   = [b["high"]  for b in bars]
+        lows    = [b["low"]   for b in bars]
+        closes  = [b["close"] for b in bars]
+        atr_val = atr(highs, lows, closes, s.get("atr_period", 14)) or (entry * 0.01)
+        trigger = s.get("trailing_trigger_candles", 3)
+
+        t1 = entry + atr_val * s.get("take_profit_atr_1", 1.5)
+        t2 = entry + atr_val * s.get("take_profit_atr_2", 3.0)
+        t3 = entry + atr_val * s.get("take_profit_atr_3", 5.0)
+
+        sig = EntrySignal(
+            symbol=symbol, passed=True,
+            entry_price=entry,
+            stop_price=entry - atr_val,
+            target_1=t1, target_2=t2, target_3=t3,
+            atr_val=atr_val, qty=qty,
+        )
+        pos          = cls(sig)
+        pos.qty_left = qty
+        pos.price    = closes[-1] if closes else entry
+
+        # Replay bars to reconstruct trail state and stop history
+        green_streak = 0
+        for i in range(1, len(bars)):
+            bar      = bars[i]
+            cur_cls  = closes[:i + 1]
+            if bar["close"] > bars[i - 1]["close"]:
+                green_streak += 1
+            else:
+                green_streak = 0
+
+            if not pos.trail_active and green_streak >= trigger:
+                pos.trail_active = True
+                pos.stop         = bar["low"]
+
+            if pos.trail_active and len(cur_cls) >= 9:
+                e9 = ema(cur_cls, 9)
+                if e9:
+                    pos.stop = max(pos.stop, e9)
+
+            if bar.get("time"):
+                pos.stop_history.append({"time": bar["time"], "price": round(pos.stop, 4)})
+
+        # Mark take-profit levels the price has already passed
+        current_price = pos.price
+        if current_price >= t1:
+            pos.t1_done = True
+        if current_price >= t2:
+            pos.t2_done = True
+
+        log.info(
+            f"Adopted {symbol}: entry={entry:.2f}  stop={pos.stop:.2f}  "
+            f"trail={'ON' if pos.trail_active else 'OFF'}  "
+            f"T1={'done' if pos.t1_done else f'{t1:.2f}'}  "
+            f"T2={'done' if pos.t2_done else f'{t2:.2f}'}  "
+            f"T3={t3:.2f}"
+        )
+        return pos
 
     @property
     def pl(self) -> float:
@@ -66,6 +135,7 @@ class Position:
             "t1_done":       self.t1_done,
             "t2_done":       self.t2_done,
             "open_since":    self.opens.isoformat(),
+            "stop_history":  self.stop_history[-300:],
         }
 
 
@@ -120,6 +190,9 @@ class Engine:
         self.scan_mode  = "POLLING"
         self.start_time = datetime.utcnow()
 
+        # Adopt any positions already open on Alpaca before the engine started
+        await self._sync_existing_positions()
+
         # Start both — stream fires when market is open, poll runs always
         self._start_stream()
         self._poll_task    = asyncio.create_task(self._poll_worker())
@@ -143,6 +216,16 @@ class Engine:
         if self.broker:
             a = self.cfg.get("alpaca", {})
             self.broker.reset(a.get("api_key",""), a.get("secret_key",""), a.get("paper", True))
+
+        # Drop scan results for symbols no longer in the watchlist
+        universe = set(self.cfg.get("scanner", {}).get("universe", []))
+        self.scan_results = {s: r for s, r in self.scan_results.items() if s in universe}
+
+        # Restart stream so it subscribes to the updated universe
+        if self.state == "RUNNING":
+            self._stop_stream()
+            self._start_stream()
+
         self._emit("config_reloaded", {})
 
     # ── stream worker (market hours live bars) ────────────────────────────────
@@ -202,7 +285,11 @@ class Engine:
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
 
-    def _on_stream_bar(self, bar):
+    async def _on_stream_bar(self, bar):
+        # drop bars for symbols no longer in the watchlist
+        universe = self.cfg.get("scanner", {}).get("universe", [])
+        if bar.symbol not in universe:
+            return
         self._last_stream_bar = datetime.utcnow()
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(
@@ -234,7 +321,7 @@ class Engine:
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            log.info(f"Poll cycle — {len(symbols)} symbols")
+            log.info(f"Poll cycle — {len(symbols)} symbols  |  {len(self.positions)} managed positions")
             for sym in symbols:
                 if self.state != "RUNNING":
                     return
@@ -244,18 +331,21 @@ class Engine:
 
                     bars = await self.broker.bars(sym, "1Min", 100)
                     if bars:
-                        # merge into persistent buffer (avoid duplicate timestamps)
+                        # merge into persistent buffer
                         buf = self.bar_buffers.setdefault(sym, [])
                         existing_times = {b["time"] for b in buf}
-                        for b in bars:
-                            if b["time"] not in existing_times:
-                                buf.append(b)
-                                existing_times.add(b["time"])
+                        new_bars = [b for b in bars if b["time"] not in existing_times]
+                        buf.extend(new_bars)
                         buf.sort(key=lambda x: x["time"])
                         if len(buf) > 200:
                             self.bar_buffers[sym] = buf[-200:]
 
                         await self._evaluate_symbol(sym, self.bar_buffers[sym], source="poll")
+
+                        # ── Stop loss monitoring via polling (covers stream gaps) ──
+                        if sym in self.positions and new_bars:
+                            for bar in new_bars:
+                                await self._manage_position(sym, bar)
                 except Exception as e:
                     log.error(f"Poll {sym}: {e}")
 
@@ -308,6 +398,29 @@ class Engine:
 
     # ── position management ───────────────────────────────────────────────────
 
+    async def _sync_existing_positions(self):
+        """On startup, adopt any Alpaca positions the engine doesn't already track."""
+        try:
+            alpaca_positions = await self.broker.positions()
+            for ap in alpaca_positions:
+                sym = ap["symbol"]
+                if sym in self.positions:
+                    continue
+                bars = await self.broker.bars(sym, "1Min", 100)
+                if not bars:
+                    log.warning(f"sync: no bars for {sym}, skipping")
+                    continue
+                self.bar_buffers[sym] = bars
+                pos = Position.from_alpaca(
+                    sym, ap["entry_price"], int(ap["qty"]), bars, self.cfg
+                )
+                self.positions[sym] = pos
+                self._emit("position_update", pos.to_dict())
+                log.info(f"Adopted existing position: {sym} x{pos.qty_left} "
+                         f"@ {pos.entry:.2f}  stop={pos.stop:.2f}")
+        except Exception as e:
+            log.error(f"sync_existing_positions: {e}")
+
     async def _try_open(self, sig: EntrySignal):
         if sig.symbol in self.positions:
             return
@@ -353,7 +466,13 @@ class Engine:
             if e9:
                 pos.stop = max(pos.stop, e9)
 
-        if bar["close"] <= pos.stop:
+        # Record stop level for chart trail line
+        if bar.get("time"):
+            pos.stop_history.append({"time": bar["time"], "price": round(pos.stop, 4)})
+
+        # Use LOW — catches intrabar wicks through the stop, not just the close
+        if bar["low"] <= pos.stop:
+            log.warning(f"STOP HIT {symbol}: low={bar['low']:.4f} <= stop={pos.stop:.4f}")
             await self._close_position(symbol, "stop")
             return
 
@@ -363,7 +482,19 @@ class Engine:
         if symbol not in self.positions:
             return
         pos = self.positions[symbol]
-        await self.broker.close(symbol)
+        if reason == "stop":
+            order_type = self.cfg.get("strategy", {}).get("stop_order_type", "market")
+            if order_type == "limit":
+                offset = self.cfg.get("strategy", {}).get("stop_limit_offset_pct", 0.003)
+                limit_price = pos.stop * (1 - offset)
+                ok = await self.broker.sell_limit(symbol, pos.qty_left, limit_price)
+                if not ok:
+                    # fallback to market if limit submission fails
+                    await self.broker.close(symbol)
+            else:
+                await self.broker.close(symbol)
+        else:
+            await self.broker.close(symbol)
         realized = (pos.price - pos.entry) * pos.qty_left
         self.daily_pnl += realized
         record = {"symbol": symbol, "entry": pos.entry, "exit": pos.price,
@@ -380,14 +511,21 @@ class Engine:
             try:
                 if date.today() != self.pnl_date:
                     self.daily_pnl = 0; self.pnl_date = date.today()
+
                 acct   = await self.broker.account()
                 equity = acct.get("equity", 0)
                 limit  = equity * self.cfg.get("risk", {}).get("daily_loss_limit_pct", 0.03)
                 if self.state == "RUNNING" and self.daily_pnl < -limit:
                     self.state = "KILL_SWITCH"
                     self._emit("engine_state", {"state": "KILL_SWITCH"})
+
                 self._emit("account_update", acct)
                 self._emit("positions_update", [p.to_dict() for p in self.positions.values()])
+
+                # Broadcast Alpaca's actual open positions (includes manual trades)
+                alpaca_pos = await self.broker.positions()
+                self._emit("alpaca_positions", alpaca_pos)
+
             except Exception as e:
                 log.error(f"monitor: {e}")
             await asyncio.sleep(5)

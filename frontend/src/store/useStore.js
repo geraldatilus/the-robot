@@ -12,9 +12,11 @@ const useStore = create((set) => ({
   dailyPnl:    0,
   connected:   false,
   tab:         "scanner",
+  feedFilter:  "ALL",   // ALL | BUY | SKIP | HOLDINGS
 
-  setTab:       (tab) => set({ tab }),
-  setConnected: (v)   => set({ connected: v }),
+  setTab:        (tab)    => set({ tab }),
+  setConnected:  (v)      => set({ connected: v }),
+  setFeedFilter: (filter) => set({ feedFilter: filter }),
 
   onMessage: (msg) => {
     const { type, data } = msg;

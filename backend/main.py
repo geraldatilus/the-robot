@@ -27,7 +27,8 @@ DIST = Path(__file__).parent.parent / "frontend" / "dist"
 async def lifespan(app: FastAPI):
     engine.set_broadcast(ws.broadcast)
     await engine.init()
-    log.info("RoBot ready — http://localhost:8080")
+    await engine.start()
+    log.info("RoBot ready — scanning — http://localhost:8080")
     yield
     await engine.stop()
 

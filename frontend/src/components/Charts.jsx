@@ -4,7 +4,7 @@ import { Maximize2, Minimize2, RefreshCw, TrendingUp, TrendingDown, X } from "lu
 import useStore from "../store/useStore";
 
 const CHART_THEME = {
-  layout:    { background: { color: "#0c1120" }, textColor: "#3a4e6a" },
+  layout:    { background: { color: "#0c1120" }, textColor: "#3a4e6a", attributionLogo: false },
   grid:      { vertLines: { color: "#1a274025" }, horzLines: { color: "#1a274025" } },
   crosshair: { mode: CrosshairMode.Normal,
                vertLine: { color: "#00c8f050" }, horzLine: { color: "#00c8f050" } },
@@ -21,11 +21,12 @@ const fpl = (v, pct) => {
 
 // ── Single chart pane ─────────────────────────────────────────────────────────
 function PositionChart({ position, enginePos, expanded, onExpand, onClose }) {
-  const containerRef = useRef(null);
-  const chartRef     = useRef(null);
-  const candleRef    = useRef(null);
-  const volumeRef    = useRef(null);
-  const linesRef     = useRef({});
+  const containerRef   = useRef(null);
+  const chartRef       = useRef(null);
+  const candleRef      = useRef(null);
+  const volumeRef      = useRef(null);
+  const stopHistRef    = useRef(null);   // line series for trailing stop path
+  const linesRef       = useRef({});
   const [tf, setTf]              = useState("1Min");
   const [loading, setLoading]   = useState(false);
   const [ohlc, setOhlc]         = useState(null);
@@ -51,6 +52,15 @@ function PositionChart({ position, enginePos, expanded, onExpand, onClose }) {
     });
     chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
 
+    stopHistRef.current = chart.addLineSeries({
+      color:                   "#ff6600",
+      lineWidth:               2,
+      lineStyle:               LineStyle.Solid,
+      priceLineVisible:        false,
+      lastValueVisible:        false,
+      crosshairMarkerVisible:  false,
+    });
+
     const ro = new ResizeObserver(() => {
       if (containerRef.current && chartRef.current) {
         chartRef.current.applyOptions({
@@ -72,7 +82,7 @@ function PositionChart({ position, enginePos, expanded, onExpand, onClose }) {
     return () => { chart.remove(); ro.disconnect(); };
   }, []);
 
-  // draw price lines when position or enginePos changes
+  // draw price lines + stop history when position or enginePos changes
   useEffect(() => {
     if (!candleRef.current) return;
     Object.values(linesRef.current).forEach(l => { try { candleRef.current.removePriceLine(l); } catch {} });
@@ -87,11 +97,15 @@ function PositionChart({ position, enginePos, expanded, onExpand, onClose }) {
     }
 
     if (enginePos) {
+      const trailActive = enginePos.trail_active;
       if (enginePos.stop_price) {
         linesRef.current.stop = candleRef.current.createPriceLine({
-          price: enginePos.stop_price, color: "#ff3355", lineWidth: 2,
-          lineStyle: LineStyle.Dashed, axisLabelVisible: true,
-          title: enginePos.trail_active ? "⬆ TRAIL STOP" : "✕ STOP",
+          price:            enginePos.stop_price,
+          color:            trailActive ? "#ff6600" : "#ff3355",
+          lineWidth:        trailActive ? 2 : 1,
+          lineStyle:        LineStyle.Dashed,
+          axisLabelVisible: true,
+          title:            trailActive ? "⬆ TRAIL STOP" : "✕ STOP",
         });
       }
       if (enginePos.target_1 && !enginePos.t1_done) {
@@ -110,6 +124,37 @@ function PositionChart({ position, enginePos, expanded, onExpand, onClose }) {
         linesRef.current.t3 = candleRef.current.createPriceLine({
           price: enginePos.target_3, color: "#00e676", lineWidth: 1,
           lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: "T3 +5×ATR",
+        });
+      }
+
+      // stop history trail line — shows the path the stop has traveled
+      if (stopHistRef.current) {
+        const hist = enginePos.stop_history;
+        if (hist && hist.length >= 2) {
+          const color = trailActive ? "#ff6600" : "#ff3355";
+          stopHistRef.current.applyOptions({ color });
+          stopHistRef.current.setData(
+            hist.map(h => ({ time: h.time, value: h.price }))
+          );
+        } else {
+          stopHistRef.current.setData([]);
+        }
+      }
+    } else {
+      // enginePos not yet synced — show a placeholder stop from Alpaca entry
+      // so the chart is never naked. Engine will replace this once it syncs.
+      if (stopHistRef.current) stopHistRef.current.setData([]);
+      const fallbackStop = position.entry_price
+        ? position.entry_price * 0.98   // 2% below entry as a visible placeholder
+        : null;
+      if (fallbackStop) {
+        linesRef.current.stop = candleRef.current.createPriceLine({
+          price:            fallbackStop,
+          color:            "#ff335580",
+          lineWidth:        1,
+          lineStyle:        LineStyle.Dashed,
+          axisLabelVisible: true,
+          title:            "✕ STOP (pending)",
         });
       }
     }
@@ -217,7 +262,15 @@ function PositionChart({ position, enginePos, expanded, onExpand, onClose }) {
           <div className="flex items-center gap-3" style={{ marginRight:8 }}>
             {currentPrice          && <LegendDot color="#4499ff" label="Now" />}
             <LegendDot color="#00c8f0" label="Entry" />
-            {enginePos?.stop_price  && <LegendDot color="#ff3355" label={enginePos.trail_active ? "Trail Stop" : "Stop"} dashed />}
+            {enginePos?.stop_price && !enginePos.trail_active && (
+              <LegendDot color="#ff3355" label="Stop" dashed />
+            )}
+            {enginePos?.trail_active && (
+              <LegendDot color="#ff6600" label="Trail Stop" dashed />
+            )}
+            {enginePos?.stop_history?.length >= 2 && (
+              <LegendDot color={enginePos.trail_active ? "#ff6600" : "#ff3355"} label="Trail Path" />
+            )}
             {enginePos?.target_1    && <LegendDot color="#00e676" label="T1/T2/T3" dashed />}
           </div>
 

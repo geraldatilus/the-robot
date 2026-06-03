@@ -70,6 +70,29 @@ async def get_trades():
     return engine.trade_log
 
 
+@router.get("/pnl/symbols")
+async def get_symbol_pnl():
+    """Per-symbol P&L aggregated from closed trades — daily and year-to-date."""
+    from datetime import date as _date, datetime as _dt
+    today = _date.today()
+    year  = today.year
+    out: Dict[str, Any] = {}
+    for t in engine.trade_log:
+        sym = t["symbol"]
+        try:
+            ts = _dt.fromisoformat(t["timestamp"]).date()
+        except Exception:
+            continue
+        pl = t.get("pl", 0)
+        if sym not in out:
+            out[sym] = {"day": 0.0, "ytd": 0.0}
+        if ts == today:
+            out[sym]["day"] += pl
+        if ts.year == year:
+            out[sym]["ytd"] += pl
+    return out
+
+
 @router.get("/scan")
 async def get_scan():
     return [
